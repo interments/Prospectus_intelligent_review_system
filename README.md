@@ -128,16 +128,6 @@ npm run dev
 
 ---
 
-## 开源建议
-
-发布前建议你补齐：
-
-- `LICENSE`（推荐 MIT 或 Apache-2.0）
-- `.env.example`
-- `.gitignore`（排除 `backend/artifacts/`, `backend/uploads/`, `node_modules/`, `.venv/`）
-- `docs/benchmark_cases.md`（放 2~3 个回归样本）
-
----
 
 ## 致谢
 

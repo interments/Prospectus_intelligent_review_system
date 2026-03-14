@@ -1,98 +1,86 @@
-# 招股书智能审核系统（Open Source Edition）
+# Prospectus Intelligent Review System (LangChain Open-Source Minimal)
 
-一个面向 IPO 招股书的智能审核系统，聚焦三类出资/披露核查场景：
-
-1. **价格波动披露**（price_fluctuation）
-2. **持股 5% 以上股东披露完整性**（shareholder_5pct）
-3. **股份质押冻结声明**（pledge_freeze_decl）
-
----
-
-## 功能概览
-
-- PDF 上传与在线预览
-- 多模块选择执行（可串行 / 并行）
-- 任务队列 + 运行进度 + 历史结果
-- 一键终止运行中任务
-- 结果页码联动定位
-- 夜间模式切换
-
----
+精简开源版（最小可运行集合）。
 
 ## 技术栈
 
-- Frontend: **Vue 3 + TypeScript + Vite**
-- Backend: **Flask**
-- 文档抽取: `pdfplumber`
-- 数据模型: `pydantic`
-- 可选队列: `redis`
-- 可选 LLM 增强: OpenAI 兼容 API（通过环境变量配置）
+- **后端框架**: Flask
+- **LLM 编排**: LangChain 1.x
+  - `langchain`
+  - `langchain-core`
+  - `langchain-openai`
+  - `langchain-community`
+- **结构化输出**: PydanticOutputParser + OutputFixingParser
+- **文档解析**: pdfplumber（经 `PdfRouter` 封装）
+- **前端框架**: Vue 3 + Vite + TypeScript
+- **任务队列**: Redis（可选）+ 内存队列回退
 
----
+## 后端技术说明
+
+- API 层：Flask 提供任务创建、轮询、取消、结果查询与删除能力
+- 任务执行：内置异步 worker，支持模块串行/并行执行
+- 队列模式：
+  - 优先使用 Redis（生产建议）
+  - Redis 不可用时自动回退进程内队列
+- LangChain 能力：
+  - PromptTemplate 组织抽取提示词
+  - PydanticOutputParser 约束结构化输出
+  - OutputFixingParser 处理格式偏差
+  - LCEL Runnable 链路组合抽取流程
+- 规则护栏：对 LLM 抽取结果进行日期/价格/阈值等可审计规则判定
+
+## 前端技术说明
+
+- UI 框架：Vue 3（Composition API）
+- 构建工具：Vite
+- 语言：TypeScript
+- 核心交互：
+  - PDF 预览与告警联动定位
+  - 任务队列管理（多选删除）
+  - 历史记录管理弹窗（二次确认删除）
+  - 设置文件弹窗（配置校验、连接测试、.env 模板复制）
+  - 三态主题切换（系统/日间/夜间）
 
 ## 目录结构
 
 ```text
-backend/
-  app/
-    server.py                         # 任务编排/API
-    modules/capital_defect/
-      price_fluctuation/
-      shareholder_5pct/
-      pledge_freeze/
-  requirements.txt
-
-frontend/
-  src/
-
-docs/
-  full_technical_manual.md
-  price_fluctuation_module_tech_report.md
-  shareholder_5pct_module_tech_report.md
-  pledge_freeze_part1_tech_report.md
+Prospectus_intelligent_review_system_langchain_open_source/
+  backend/
+    app/
+      core/
+      modules/
+        shareholder_5pct/
+        price_fluctuation_langchain/
+        pledge_freeze_langchain/
+      server.py
+    requirements.txt
+    .env.example
+  frontend/
+    src/
+    package.json
+    package-lock.json
+    vite.config.ts
+    index.html
+  README.md
+  .gitignore
 ```
 
----
+## 快速启动
 
-## 快速开始
-
-### 1) 安装后端依赖
+### 1) 启动后端
 
 ```bash
 cd backend
 python -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-```
-
-### 2) 配置环境变量
-
-在项目根目录或 `backend/` 目录创建 `.env`（按需）：
-
-```env
-# 可选：LLM（若不配则会走规则兜底，部分功能效果会下降）
-ARK_API_KEY=
-ARK_BASE_URL=
-ARK_MODEL=
-
-# 可选：任务队列
-REDIS_URL=
-REDIS_QUEUE_KEY=prospectus:task_queue
-
-# 默认执行模式（true 并行 / false 串行）
-MODULES_PARALLEL=true
-```
-
-### 3) 启动后端
-
-```bash
-cd backend
+cp .env.example .env        # Windows: copy .env.example .env
 python -m app.server
 ```
 
-默认地址：`http://localhost:9000`
+默认端口：`9010`
 
-### 4) 启动前端
+### 2) 启动前端
 
 ```bash
 cd frontend
@@ -100,35 +88,59 @@ npm install
 npm run dev
 ```
 
-默认地址：`http://localhost:8432`
+默认端口：`8432`
 
----
+## 必要配置（backend/.env）
 
-## API 简表
+必填（模型）：
 
-- `GET /api/v1/health`
-- `GET /api/v1/runtime`
-- `POST /api/v1/runtime`
-- `POST /api/v1/tasks`
-- `POST /api/v1/tasks/<task_id>/rerun`
-- `POST /api/v1/tasks/<task_id>/cancel`
-- `GET /api/v1/tasks`
-- `GET /api/v1/tasks/<task_id>`
-- `GET /api/v1/results`
-- `GET /api/v1/result?path=...`
-- `GET /api/v1/file?path=...`
+- `ARK_BASE_URL`
+- `ARK_API_KEY`
+- `ARK_MODEL`
 
----
+可选：
 
-## 当前能力边界
+- `REDIS_URL`
+- `REDIS_QUEUE_KEY`（默认 `prospectus:task_queue`）
+- `FLASK_PORT`（默认 `9010`）
+- `MODULES_PARALLEL`（默认 `true`）
 
-- 不同券商/项目的标题风格差异较大，章节定位规则需持续迭代
-- 极复杂跨页表格仍可能有解析噪声
-- 质押冻结“已解除/未解除”语义判断目前以提示词+规则为主
+## 前端界面预览
 
----
+### 01. 系统总览
 
+![overview](imgs/01-overview.png)
 
-## 致谢
+### 02. 模块选择与运行控制
 
-感谢所有用于测试与反馈的公开招股书样本与贡献者。
+![modules-and-run](imgs/02-modules-and-run.png)
+
+### 03. 任务队列管理（多选删除）
+
+![task-queue-management](imgs/03-task-queue-management.png)
+
+### 04. 历史分析记录管理弹窗
+
+![history-modal](imgs/04-history-modal.png)
+
+### 05. 设置文件弹窗（配置校验/连接测试）
+
+![settings-modal](imgs/05-settings-modal.png)
+
+### 06. 风险分级结论展示
+
+![risk-conclusion](imgs/06-risk-conclusion.png)
+
+### 07. PDF 联动定位
+
+![pdf-linkage](imgs/07-pdf-linkage.png)
+
+### 08. 夜间模式
+
+![dark-mode](imgs/08-dark-mode.png)
+
+## 说明
+
+- 本版本仅保留运行必需文件，不包含本地测试产物与内部文档。
+- 架构采用 **LangChain 抽取 + 本地规则判定**，兼顾语义能力与可审计性。
+- 发布前请执行：`RELEASE_CHECKLIST.md`

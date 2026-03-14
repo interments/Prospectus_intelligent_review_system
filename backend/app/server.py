@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import shutil
 import subprocess
 import sys
 import threading
@@ -14,7 +15,8 @@ from dotenv import load_dotenv
 from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
 
-from app.modules.capital_defect.price_fluctuation.extractors.pdf_router import PdfRouter
+from app.core.llm import load_llm_config
+from app.modules.price_fluctuation.extractors.pdf_router import PdfRouter
 
 try:
     import redis
@@ -38,9 +40,9 @@ RUNTIME_MODULES_PARALLEL = MODULES_PARALLEL_DEFAULT
 TASKS_FILE = ARTIFACTS_DIR / "tasks.json"
 
 MODULE_CMDS = {
-    "price_fluctuation": "app.modules.capital_defect.price_fluctuation.pipeline.run_price_fluctuation",
-    "shareholder_5pct": "app.modules.capital_defect.shareholder_5pct.pipeline.run_shareholder_5pct",
-    "pledge_freeze_decl": "app.modules.capital_defect.pledge_freeze.pipeline.run_pledge_freeze",
+    "price_fluctuation": "app.modules.price_fluctuation_langchain.pipeline.run_price_fluctuation_langchain",
+    "shareholder_5pct": "app.modules.shareholder_5pct.pipeline.run_shareholder_5pct_langchain",
+    "pledge_freeze_decl": "app.modules.pledge_freeze_langchain.pipeline.run_pledge_freeze_langchain",
 }
 
 app = Flask(__name__)
@@ -112,7 +114,6 @@ def _parse_modules(raw: str | None) -> list[str]:
             s = v.strip()
             if not s:
                 return []
-            # 兼容被二次 JSON 编码的字符串（例如 '"[\\"pledge_freeze_decl\\"]"'）
             if (s.startswith("[") and s.endswith("]")) or (s.startswith('"') and s.endswith('"')):
                 try:
                     parsed = json.loads(s)
@@ -147,7 +148,6 @@ def _ensure_shared_preprocessed(task: dict) -> str | None:
 
 
 def _run_module(task: dict, module: str) -> tuple[bool, str, str | None]:
-    mod = task["modules"][module]
     mod_workdir = Path(task["workdir"]) / module
     mod_workdir.mkdir(parents=True, exist_ok=True)
     cmd = [
@@ -269,7 +269,18 @@ threading.Thread(target=_worker, daemon=True).start()
 
 @app.get("/api/v1/health")
 def health():
-    return jsonify({"ok": True, "modules_parallel": RUNTIME_MODULES_PARALLEL, "redis_enabled": REDIS_CLIENT is not None})
+    cfg = load_llm_config()
+    return jsonify(
+        {
+            "ok": True,
+            "runtime": "langchain-refactor",
+            "llm_configured": bool(cfg.api_key),
+            "llm_model": cfg.model,
+            "llm_base_url": cfg.base_url,
+            "modules_parallel": RUNTIME_MODULES_PARALLEL,
+            "redis_enabled": REDIS_CLIENT is not None,
+        }
+    )
 
 
 @app.get("/api/v1/runtime")
@@ -339,6 +350,7 @@ def create_task():
         modules_parallel = False
     else:
         modules_parallel = RUNTIME_MODULES_PARALLEL
+
     filename = f.filename or f"upload_{uuid.uuid4().hex}.pdf"
     saved_pdf = UPLOAD_DIR / f"{uuid.uuid4().hex}_{filename}"
     f.save(saved_pdf)
@@ -375,25 +387,59 @@ def create_task():
     return jsonify(task)
 
 
-@app.post("/api/v1/tasks/<task_id>/rerun")
-def rerun_modules(task_id: str):
+@app.post("/api/v1/results/batch-delete")
+def batch_delete_results():
     body = request.get_json(silent=True) or {}
-    modules = _parse_modules(','.join(body.get("modules", [])) if isinstance(body.get("modules"), list) else body.get("modules"))
-    with TASKS_LOCK:
-        task = TASKS.get(task_id)
-        if not task:
-            return jsonify({"error": "task not found"}), 404
-        for m in modules:
-            task["modules"].setdefault(m, {"status": "queued", "result_path": None, "log": "", "updated_at": _now()})
-            task["modules"][m]["status"] = "queued"
-            task["modules"][m]["updated_at"] = _now()
-            if m not in task["selected_modules"]:
-                task["selected_modules"].append(m)
-        task["status"] = "queued"
-        task["updated_at"] = _now()
-        _save_tasks()
-    _enqueue(task_id)
-    return jsonify(TASKS[task_id])
+    paths = body.get("result_paths") or []
+    if not isinstance(paths, list):
+        return jsonify({"error": "result_paths must be a list"}), 400
+
+    deleted: list[str] = []
+    skipped: list[dict] = []
+
+    for raw in paths:
+        p = Path(str(raw or "")).resolve()
+        try:
+            p.relative_to(ARTIFACTS_DIR.resolve())
+        except Exception:
+            skipped.append({"path": str(raw), "reason": "out_of_artifacts"})
+            continue
+
+        # 支持传 task_root 或 result.json 路径
+        task_root = None
+        p_str = str(p).replace("\\", "/")
+        if "/task_" in p_str:
+            if p.name == "result.json" and p.parent.parent.name.startswith("task_"):
+                task_root = p.parent.parent
+            elif p.name.startswith("task_") and p.is_dir():
+                task_root = p
+            else:
+                for parent in p.parents:
+                    if parent.name.startswith("task_"):
+                        task_root = parent
+                        break
+
+        if task_root and task_root.exists() and task_root.is_dir():
+            shutil.rmtree(task_root, ignore_errors=True)
+            deleted.append(str(task_root))
+            task_root_str = str(task_root)
+            with TASKS_LOCK:
+                for tid, t in list(TASKS.items()):
+                    if str(t.get("workdir", "")) == task_root_str and t.get("status") in {"success", "failed", "cancelled"}:
+                        TASKS.pop(tid, None)
+                _save_tasks()
+            continue
+
+        if p.exists() and p.is_file() and p.name == "result.json":
+            try:
+                p.unlink()
+                deleted.append(str(p))
+            except Exception:
+                skipped.append({"path": str(raw), "reason": "unlink_failed"})
+        else:
+            skipped.append({"path": str(raw), "reason": "not_found"})
+
+    return jsonify({"ok": True, "deleted": deleted, "skipped": skipped})
 
 
 @app.post("/api/v1/tasks/<task_id>/cancel")
@@ -445,5 +491,49 @@ def get_task(task_id: str):
     return jsonify(task)
 
 
+@app.delete("/api/v1/tasks/<task_id>")
+def delete_task(task_id: str):
+    with TASKS_LOCK:
+        task = TASKS.get(task_id)
+        if not task:
+            return jsonify({"error": "task not found"}), 404
+        if task.get("status") not in {"success", "failed", "cancelled"}:
+            return jsonify({"error": "only finished tasks can be deleted"}), 400
+        TASKS.pop(task_id, None)
+        _save_tasks()
+    return jsonify({"ok": True, "deleted": [task_id]})
+
+
+@app.post("/api/v1/tasks/batch-delete")
+def batch_delete_tasks():
+    body = request.get_json(silent=True) or {}
+    ids = body.get("task_ids") or []
+    if not isinstance(ids, list):
+        return jsonify({"error": "task_ids must be a list"}), 400
+
+    deleted: list[str] = []
+    skipped: list[dict] = []
+
+    with TASKS_LOCK:
+        for raw_id in ids:
+            task_id = str(raw_id or "").strip()
+            if not task_id:
+                continue
+            task = TASKS.get(task_id)
+            if not task:
+                skipped.append({"id": task_id, "reason": "not_found"})
+                continue
+            if task.get("status") not in {"success", "failed", "cancelled"}:
+                skipped.append({"id": task_id, "reason": "not_finished"})
+                continue
+            TASKS.pop(task_id, None)
+            deleted.append(task_id)
+
+        _save_tasks()
+
+    return jsonify({"ok": True, "deleted": deleted, "skipped": skipped})
+
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=9000, debug=False)
+    port = int(os.getenv("FLASK_PORT", "9010"))
+    app.run(host="0.0.0.0", port=port, debug=False)

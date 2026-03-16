@@ -13,8 +13,8 @@ from langchain_core.runnables import RunnableLambda
 from langchain_classic.output_parsers import OutputFixingParser
 
 from app.core.llm import build_chat_llm
-from app.modules.price_fluctuation.extractors.pdf_router import PdfRouter
-from app.modules.price_fluctuation.schemas.models import TableBlock, TextBlock
+from app.shared.pdf.extractors import PdfRouter
+from app.shared.pdf.schemas import TableBlock, TextBlock
 
 
 PCT_RE = re.compile(r"([0-9]+(?:\.[0-9]+)?)\s*[%％]")
@@ -28,8 +28,22 @@ class DisclosedOutput(BaseModel):
     items: list[DisclosedItem] = Field(default_factory=list)
 
 
+class NameMatchItem(BaseModel):
+    expected_name: str
+    matched: bool = False
+    matched_name: str | None = None
+    confidence: float | None = None
+    reason: str | None = None
+
+
+class NameMatchOutput(BaseModel):
+    items: list[NameMatchItem] = Field(default_factory=list)
+
+
 def _norm_name(s: str) -> str:
-    return re.sub(r"\s+", "", (s or "").strip())
+    x = re.sub(r"\s+", "", (s or "").strip())
+    x = x.replace("（", "(").replace("）", ")")
+    return x
 
 
 def _pct_to_float(s: str) -> float | None:
@@ -40,6 +54,13 @@ def _pct_to_float(s: str) -> float | None:
         return float(m.group(1))
     except Exception:
         return None
+
+
+def _alias_norm_name(s: str) -> str:
+    x = _norm_name(s)
+    x = re.sub(r"（有限合伙）|\(有限合伙\)|有限合伙|股份有限公司|有限公司|合伙企业", "", x)
+    x = re.sub(r"^惠州市|^宁波梅山保税港区", "", x)
+    return x
 
 
 def _locate_pages(text_blocks: list[TextBlock]) -> tuple[set[int], set[int]]:
@@ -142,6 +163,66 @@ def _extract_expected_from_tables(table_blocks: list[TableBlock], expected_pages
                 out[key] = {"name": name, "holding_pct": pct, "page": tb.page, "source": "table_fallback"}
 
     return list(out.values())
+
+
+def _llm_name_match(disclosed: list[dict], expected: list[dict], logger: logging.Logger) -> tuple[set[str], list[dict]]:
+    """二次LLM表对表判别（调用Doubao API）。返回: (命中的expected规范名集合, 判别详情)."""
+    if not disclosed or not expected:
+        return set(), []
+
+    llm = build_chat_llm(temperature=0)
+    parser = PydanticOutputParser(pydantic_object=NameMatchOutput)
+    fixing_parser = OutputFixingParser.from_llm(parser=parser, llm=llm)
+
+    prompt_tmpl = PromptTemplate.from_template(
+        "你是公司名称同一性判别助手。请将 expected_list 与 disclosed_list 做一一语义对齐。\n"
+        "常见同一主体情形：简称/全称、省市前缀差异、括号尾注（如CS）、有限公司/合伙企业后缀差异。\n"
+        "若 expected_name 在 disclosed_list 中有同一主体，请 matched=true，并填 matched_name、confidence(0~1)、reason。\n"
+        "仅在较高把握时返回 matched=true（建议 confidence>=0.7）。\n\n"
+        "输出格式：\n{format_instructions}\n\n"
+        "disclosed_list={disclosed}\n"
+        "expected_list={expected}"
+    )
+
+    chain = (
+        RunnableLambda(lambda x: prompt_tmpl.format(**x))
+        | llm
+        | RunnableLambda(lambda m: m.content if isinstance(m.content, str) else str(m.content))
+        | RunnableLambda(lambda raw: fixing_parser.parse(raw))
+    )
+
+    try:
+        logger.info("llm call start: stage=name_match_second_pass")
+        data: NameMatchOutput = chain.invoke(
+            {
+                "disclosed": json.dumps(disclosed, ensure_ascii=False),
+                "expected": json.dumps(expected, ensure_ascii=False),
+                "format_instructions": parser.get_format_instructions(),
+            }
+        )
+        logger.info("llm call done: stage=name_match_second_pass items=%s", len(data.items))
+
+        matched = set()
+        details: list[dict] = []
+        for x in data.items:
+            conf = x.confidence if isinstance(x.confidence, (int, float)) else 0.0
+            ok = bool(x.matched) and conf >= 0.7
+            if ok and x.expected_name:
+                matched.add(_norm_name(x.expected_name))
+            details.append(
+                {
+                    "expected_name": x.expected_name,
+                    "matched": bool(x.matched),
+                    "matched_name": x.matched_name,
+                    "confidence": conf,
+                    "reason": x.reason,
+                    "accepted": ok,
+                }
+            )
+        return matched, details
+    except Exception as e:
+        logger.warning("llm call failed: stage=name_match_second_pass err=%s", str(e))
+        return set(), []
 
 
 def _extract_disclosed_with_langchain(text_blocks: list[TextBlock], disclosed_pages: set[int], logger: logging.Logger) -> list[dict]:
@@ -289,8 +370,21 @@ def main() -> None:
     disclosed = _extract_disclosed_with_langchain(text_blocks, disclosed_pages, logger)
     expected = _extract_expected_from_tables(table_blocks, expected_pages)
 
+    # 一次匹配：精确规范名 + 别名归一
     disclosed_set = {_norm_name(x["name"]) for x in disclosed}
-    missing = [x for x in expected if _norm_name(x["name"]) not in disclosed_set]
+    disclosed_alias_set = {_alias_norm_name(x["name"]) for x in disclosed}
+
+    unmatched = []
+    for x in expected:
+        n = _norm_name(x["name"])
+        a = _alias_norm_name(x["name"])
+        if n in disclosed_set or a in disclosed_alias_set:
+            continue
+        unmatched.append(x)
+
+    # 二次匹配：LLM语义判别（同Doubao API，表到表对齐）
+    llm_matched_expected_norm, llm_match_details = _llm_name_match(disclosed, unmatched, logger)
+    missing = [x for x in unmatched if _norm_name(x["name"]) not in llm_matched_expected_norm]
 
     issues = []
     for m in missing:
@@ -336,6 +430,7 @@ def main() -> None:
         "disclosed_list_raw": disclosed,
         "expected_list_raw": expected,
         "missing_shareholders": missing,
+        "name_match_second_pass": llm_match_details,
         "negative_output": {
             "is_negative": is_negative,
             "message": "阴性样本：未发现5%以上股东漏披露" if is_negative else "非阴性样本：检测到漏披露",

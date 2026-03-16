@@ -14,8 +14,8 @@ from langchain_core.runnables import RunnableLambda
 from langchain_classic.output_parsers import OutputFixingParser
 
 from app.core.llm import build_chat_llm
-from app.modules.price_fluctuation.extractors.pdf_router import PdfRouter
-from app.modules.price_fluctuation.schemas.models import TextBlock, TableBlock
+from app.shared.pdf.extractors import PdfRouter
+from app.shared.pdf.schemas import TextBlock, TableBlock
 
 
 class YesNoOutput(BaseModel):
@@ -55,12 +55,19 @@ def _locate_sections(text_blocks: list[TextBlock]) -> dict:
     parent_heading_line = re.compile(r"^\s*第[一二三四五六七八九十百零〇\d]+节\s*(?:发行人|公司)基本情况\s*$", re.M)
     section_heading_line = re.compile(r"^\s*第[一二三四五六七八九十百零〇\d]+节\s*", re.M)
 
+    # 标题在不同招股书里常见变体：
+    # - “控制人的情况”/“控制人情况”
+    # - “持有发行人5%以上股份的主要股东…” / “持股5%以上主要股东…”
+    # - “董事、监事、高级管理人员及核心技术人员” 后缀可有可无（情况/简介/基本情况）
     s5_heading_line = re.compile(
-        r"^\s*[（(]?[五六56][）)]?、\s*(?:持有发行人\s*5%\s*以上股份的主要股东及实际控制人(?:基本)?情况|持股\s*5%\s*以上(?:主要)?股东及实际控制人(?:基本)?情况)\s*$",
+        r"^\s*[（(]?[五六七567][）)]?、\s*"
+        r"(?:持有发行人\s*5%\s*以上股份的主要股东|持股\s*5%\s*以上(?:股份的)?(?:主要)?股东)"
+        r"\s*及\s*实际控制人(?:的)?(?:基本)?(?:情况)?\s*$",
         re.M,
     )
     mg_heading_line = re.compile(
-        r"^\s*[（(]?[七八78][）)]?、\s*董事、监事、高级管理人员(?:与|及)核心技术人员(?:的简要情况)?\s*$",
+        r"^\s*[（(]?[七八九789][）)]?、\s*"
+        r"董事、监事、高级管理人员(?:与|及)核心技术人员(?:的)?(?:简要)?(?:基本)?(?:情况|简介)?\s*$",
         re.M,
     )
     peer_heading = re.compile(r"^\s*[一二三四五六七八九十]+、", re.M)
@@ -116,6 +123,74 @@ def _locate_sections(text_blocks: list[TextBlock]) -> dict:
 
     s5_text, s5_pages = collect(t5_idx, 12, s5_heading_line)
     mg_text, mg_pages = collect(tmg_idx, 20, mg_heading_line)
+
+    # 兜底：部分招股书标题不标准/OCR断裂时，按语义关键词定位短窗口，避免 page=1 的假告警
+    def fallback_collect(keyword_fn, max_pages: int) -> tuple[str, list[int]]:
+        hit_idx = None
+        for i in range(search_start, search_end):
+            raw = blocks[i].text or ""
+            if keyword_fn(raw):
+                hit_idx = i
+                break
+        if hit_idx is None:
+            for i, b in enumerate(blocks):
+                if keyword_fn(b.text or ""):
+                    hit_idx = i
+                    break
+        if hit_idx is None:
+            return "", []
+
+        start_page = blocks[hit_idx].page
+        pages: list[int] = []
+        parts: list[str] = []
+        for j in range(hit_idx, len(blocks)):
+            b = blocks[j]
+            raw = b.text or ""
+            if b.page - start_page >= max_pages:
+                break
+            if section_heading_line.search(raw) and j > hit_idx:
+                break
+            pages.append(b.page)
+            parts.append(raw)
+        return "\n".join(parts).strip(), sorted(set(pages))
+
+    if not s5_pages:
+        s5_text, s5_pages = fallback_collect(
+            lambda raw: (
+                ("5%" in _norm(raw) or "５%" in _norm(raw))
+                and ("股东" in raw)
+                and ("实际控制人" in raw or "控制人" in raw)
+            ),
+            max_pages=5,
+        )
+
+    if not mg_pages:
+        mg_text, mg_pages = fallback_collect(
+            lambda raw: (
+                ("董事、监事、高级管理人员" in raw or "董事、监事和高级管理人员" in raw)
+                and ("核心技术人员" in raw)
+            ) or ("所持股份不存在质押或冻结" in raw),
+            max_pages=6,
+        )
+
+    # 若正文中出现明确“所持股份不存在质押或冻结”语句，但未被纳入mg窗口，则补充该页短窗口
+    neg_hit_idx = None
+    for i in range(search_start, search_end):
+        raw = blocks[i].text or ""
+        if "所持股份不存在质押或冻结" in raw or "不存在质押或冻结情况" in raw:
+            neg_hit_idx = i
+            break
+    if neg_hit_idx is not None:
+        p = blocks[neg_hit_idx].page
+        if p not in set(mg_pages):
+            add_text, add_pages = fallback_collect(
+                lambda raw: ("所持股份不存在质押或冻结" in raw) or ("不存在质押或冻结情况" in raw),
+                max_pages=2,
+            )
+            if add_text:
+                mg_text = (mg_text + "\n" + add_text).strip() if mg_text else add_text
+                mg_pages = sorted(set(mg_pages + add_pages))
+
     return {"s5_text": s5_text, "s5_pages": s5_pages, "mg_text": mg_text, "mg_pages": mg_pages}
 
 
@@ -180,12 +255,39 @@ def _dedup_events(events: list[dict]) -> list[dict]:
     seen = set()
     out = []
     for e in events:
-        k = (_norm(e.get("name", "")), e.get("person_type"), e.get("event_type"))
+        k = (_norm(e.get("name", "")), e.get("person_type"), e.get("event_type"), _norm(e.get("event_status", "")))
         if k in seen:
             continue
         seen.add(k)
         out.append(e)
     return out
+
+
+def _is_negative_event(e: dict) -> bool:
+    txt = _norm((e.get("event_status") or "") + " " + (e.get("event_desc") or ""))
+    if not txt:
+        return False
+    neg_markers = ["不存在", "无质押", "无冻结", "未质押", "未冻结", "未发生", "已解除", "解除质押", "解除冻结"]
+    return any(k in txt for k in neg_markers)
+
+
+def _is_positive_risk_event(e: dict) -> bool:
+    txt = _norm((e.get("event_status") or "") + " " + (e.get("event_desc") or ""))
+    if not txt:
+        return False
+    pos_markers = ["存在", "已质押", "质押中", "被冻结", "冻结中", "司法冻结", "轮候冻结"]
+    return any(k in txt for k in pos_markers) and (not _is_negative_event(e))
+
+
+def _split_event_polarity(events: list[dict]) -> tuple[list[dict], list[dict]]:
+    negative, risk = [], []
+    for e in events:
+        if _is_negative_event(e):
+            negative.append(e)
+        elif _is_positive_risk_event(e):
+            risk.append(e)
+        # 其余“无法判定极性”的事件先不计入风险，避免误报
+    return negative, risk
 
 
 def main() -> None:
@@ -255,7 +357,8 @@ def main() -> None:
         if i < len(mg_flags) and mg_flags[i]:
             events.extend(_ask_extract_events(llm, c, logger))
 
-    events = _dedup_events(events)
+    events_all = _dedup_events(events)
+    negative_events, risk_events = _split_event_polarity(events_all)
 
     if not s5_disclosed and not mg_disclosed:
         result = {
@@ -295,15 +398,16 @@ def main() -> None:
                 "person_type": e.get("person_type"),
                 "event_type": e.get("event_type"),
             }
-            for e in events
+            for e in risk_events
         ]
-        is_negative = (len(events) == 0 and bool(s5_disclosed or mg_disclosed))
+        is_negative = (len(risk_events) == 0 and bool(s5_disclosed or mg_disclosed))
         result = {
             "summary": {
                 "runtime": "langchain",
-                "status": "pass" if len(events) == 0 else "fail",
+                "status": "pass" if len(risk_events) == 0 else "fail",
                 "disclosed_detected": bool(s5_disclosed or mg_disclosed),
-                "event_count": len(events),
+                "event_count": len(risk_events),
+                "negative_event_count": len(negative_events),
                 "s5_disclosed": s5_disclosed,
                 "mg_disclosed": mg_disclosed,
                 "s5_chunk_count": len(s5_chunks),
@@ -314,7 +418,9 @@ def main() -> None:
                 "negative_note": "已检测到阴性披露（存在无质押/冻结声明）" if is_negative else "检测到质押/冻结事件或风险",
             },
             "alerts": alerts,
-            "events": events,
+            "events": risk_events,
+            "negative_events": negative_events,
+            "events_all": events_all,
             "negative_output": {
                 "is_negative": is_negative,
                 "message": "阴性样本：检测到无质押/冻结声明，且未提取到风险事件" if is_negative else "非阴性样本：存在质押/冻结事件或风险",
@@ -323,13 +429,14 @@ def main() -> None:
 
     with (workdir / "events.csv").open("w", encoding="utf-8", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["姓名", "人员类型", "事件类型", "事件状态", "事件描述"])
-        for e in events:
-            w.writerow([e.get("name"), e.get("person_type"), e.get("event_type"), e.get("event_status"), e.get("event_desc")])
+        w.writerow(["姓名", "人员类型", "事件类型", "事件状态", "事件描述", "是否阴性声明"])
+        for e in events_all:
+            w.writerow([e.get("name"), e.get("person_type"), e.get("event_type"), e.get("event_status"), e.get("event_desc"), "是" if _is_negative_event(e) else "否"])
 
     (workdir / "result.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-    logger.info("pipeline done: status=%s events=%s", result["summary"]["status"], len(events))
-    print(f"Done. status={result['summary']['status']} events={len(events)}")
+    final_events = result.get("events", [])
+    logger.info("pipeline done: status=%s events=%s", result["summary"]["status"], len(final_events))
+    print(f"Done. status={result['summary']['status']} events={len(final_events)}")
     print(f"Artifacts: {workdir}")
 
 

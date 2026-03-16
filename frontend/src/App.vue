@@ -556,6 +556,31 @@ function resolveTaskResultPath(task: TaskItem) {
   return '';
 }
 
+async function loadResultByTask(task: TaskItem) {
+  moduleResults.value = { price_fluctuation: null, shareholder_5pct: null, pledge_freeze_decl: null };
+
+  const mods = task.modules || {};
+  const pPrice = mods.price_fluctuation?.result_path;
+  const pS5 = mods.shareholder_5pct?.result_path;
+  const pPledge = mods.pledge_freeze_decl?.result_path;
+
+  if (pPrice) moduleResults.value.price_fluctuation = await tryLoadResult(toPosixPath(pPrice));
+  if (pS5) moduleResults.value.shareholder_5pct = await tryLoadResult(toPosixPath(pS5));
+  if (pPledge) moduleResults.value.pledge_freeze_decl = await tryLoadResult(toPosixPath(pPledge));
+
+  // 若 task.modules 里没有完整路径，再走历史兼容逻辑
+  if (!pPrice && !pS5 && !pPledge) {
+    const p = resolveTaskResultPath(task);
+    if (p) await loadResultByPath(toPosixPath(p));
+  } else {
+    currentResult.value = moduleResults.value.price_fluctuation || moduleResults.value.shareholder_5pct || moduleResults.value.pledge_freeze_decl;
+    activeAlertIndex.value = -1;
+    currentSearchText.value = '';
+    locatedSide.value = '';
+    syncPdfByResultPath(resolveTaskResultPath(task));
+  }
+}
+
 function toPosixPath(p: string) {
   return String(p || '').replace(/\\/g, '/');
 }
@@ -681,7 +706,7 @@ async function startTask() {
     await fetchTasks();
     const immediateResultPath = resolveTaskResultPath(task);
     if (task.status === 'success' && immediateResultPath) {
-      await loadResultByPath(immediateResultPath);
+      await loadResultByTask(task);
       await fetchResults();
       setProgress(100, '命中缓存结果，分析完成');
       running.value = false;
@@ -713,9 +738,9 @@ function startPolling() {
         pollTimer.value = null;
         const p = resolveTaskResultPath(t);
         if (p) {
-          await loadResultByPath(p);
+          await loadResultByTask(t);
           await fetchResults();
-          selectedResult.value = p;
+          selectedResult.value = toPosixPath(p);
         }
         setProgress(100, '分析完成');
         running.value = false;
@@ -865,12 +890,12 @@ onBeforeUnmount(() => {
           <small>当前定位：{{ locatedSide || '-' }}；{{ locateHint }}</small>
         </div>
 
-        <div v-if="!pdfBaseUrl" class="pdf-empty">
+        <div v-if="!pdfBaseUrl" class="pdf-empty" :class="{ 'is-drag-over': dragOver }">
           <div class="pdf-empty-inner">
             <div class="pdf-empty-title">暂无招股书</div>
             <div class="muted" style="margin-top:6px;">支持拖拽 PDF 到此区域，或点击选择文件</div>
             <div class="empty-actions">
-              <button class="btn" @click="triggerFilePicker">选择文件</button>
+              <button class="btn upload-btn" @click="triggerFilePicker">选择 PDF 文件</button>
             </div>
           </div>
         </div>

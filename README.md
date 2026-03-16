@@ -28,6 +28,7 @@
   - OutputFixingParser 处理格式偏差
   - LCEL Runnable 链路组合抽取流程
 - 规则护栏：对 LLM 抽取结果进行日期/价格/阈值等可审计规则判定
+- 通用能力抽离：`app/shared/pdf` 统一承载 PDF 抽取与数据结构（非旧版回退逻辑）
 
 ## 前端技术说明
 
@@ -48,6 +49,8 @@ Prospectus_intelligent_review_system_langchain_open_source/
   backend/
     app/
       core/
+      shared/
+        pdf/                    # 通用PDF抽取与数据结构
       modules/
         shareholder_5pct/
         price_fluctuation_langchain/
@@ -104,6 +107,9 @@ npm run dev
 - `REDIS_QUEUE_KEY`（默认 `prospectus:task_queue`）
 - `FLASK_PORT`（默认 `9010`）
 - `MODULES_PARALLEL`（默认 `true`）
+- `ARK_TIMEOUT_SECONDS`（默认 `90`，单次LLM请求超时）
+- `ARK_MAX_RETRIES`（默认 `2`，LLM请求重试次数）
+- `USD_CNY_FALLBACK`（默认 `7.20`，历史汇率不可用时回退值）
 
 ## 前端界面预览
 
@@ -138,6 +144,18 @@ npm run dev
 ### 08. 夜间模式
 
 ![dark-mode](imgs/08-dark-mode.png)
+
+## 最近更新（2026-03）
+
+- `price_fluctuation_langchain`
+  - 分层标题下钻定位 + 同级边界截断
+  - USD 单价按事件日期历史汇率折算（akshare），失败回退 `USD_CNY_FALLBACK`
+- `shareholder_5pct`
+  - 新增二次 LLM“表对表”对齐（`matched_name/confidence/reason`）
+  - 名称归一增强（中英括号、后缀、地域前缀）
+- `pledge_freeze_langchain`
+  - 标题 miss 时关键词短窗口兜底定位
+  - 阴阳极性过滤：仅明确风险事件告警，阴性声明不误报
 
 ## 说明
 

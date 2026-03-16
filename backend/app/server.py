@@ -16,7 +16,7 @@ from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
 
 from app.core.llm import load_llm_config
-from app.modules.price_fluctuation.extractors.pdf_router import PdfRouter
+from app.shared.pdf.extractors import PdfRouter
 
 try:
     import redis
